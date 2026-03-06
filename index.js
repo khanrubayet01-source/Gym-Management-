@@ -5,6 +5,10 @@ const app = express();
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 const PORT = process.env.PORT || 10000;
+const UNLOCK_COMMAND = process.env.F22_UNLOCK_COMMAND || "SET OPTION UNLOCK=5";
+
+// In-memory queue by device serial number (SN) for ADMS command polling.
+const pendingCommandsBySn = new Map();
 
 // F22/ADMS can send plain text with inconsistent content-types.
 app.use(express.text({ type: "*/*", limit: "2mb" }));
@@ -65,6 +69,27 @@ function parseAttlogLines(rawBody) {
   return events;
 }
 
+function queueCommand(sn, commandPayload) {
+  const command = `C:${Date.now()}:${commandPayload}`;
+  const key = sn || "UNKNOWN_SN";
+  if (!pendingCommandsBySn.has(key)) {
+    pendingCommandsBySn.set(key, []);
+  }
+  pendingCommandsBySn.get(key).push(command);
+  console.log(`[QUEUE] SN=${key} command=${command}`);
+}
+
+function dequeueCommand(sn) {
+  const key = sn || "UNKNOWN_SN";
+  const queue = pendingCommandsBySn.get(key);
+  if (!queue || queue.length === 0) return null;
+  const cmd = queue.shift();
+  if (queue.length === 0) {
+    pendingCommandsBySn.delete(key);
+  }
+  return cmd;
+}
+
 app.get("/", (req, res) => {
   return textOk(res, "Gym Bridge is Online");
 });
@@ -78,6 +103,13 @@ app.get("/iclock/getrequest", async (req, res) => {
   const sn = req.query.SN || "UNKNOWN_SN";
   console.log(`[GETREQUEST] SN=${sn} query=${JSON.stringify(req.query)}`);
 
+  // Priority 1: deliver queued runtime commands (e.g., unlock).
+  const queued = dequeueCommand(sn);
+  if (queued) {
+    return textOk(res, queued);
+  }
+
+  // Priority 2: deliver user sync commands.
   const { data: newMember, error } = await supabase
     .from("members")
     .select("id, machine_id, full_name, card_number")
@@ -174,6 +206,11 @@ app.all("/iclock/cdata", async (req, res) => {
               : new Date(event.scannedAt).toISOString(),
         },
       ]);
+
+      if (active) {
+        // F22 unlock command is delivered on next /iclock/getrequest poll.
+        queueCommand(sn, UNLOCK_COMMAND);
+      }
 
       console.log(
         `[CDATA] machine_id=${machineId} member=${member.full_name || member.id} result=${active ? "GRANTED" : "DENIED"}`
